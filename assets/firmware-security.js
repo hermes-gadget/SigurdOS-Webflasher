@@ -7,6 +7,7 @@ const PARTITION_TABLE_SIZE = 0x1000;
 const BOOT_APP0_OFFSET = 0xe000;
 const APP_OFFSET = 0x10000;
 const MAX_MANIFEST_SIZE = 64 * 1024;
+const MAX_SIGNATURE_SIZE = 4 * 1024;
 const ESP_IMAGE_MAGIC = 0xe9;
 const ESP32S3_CHIP_ID = 9;
 const MAX_IMAGE_SEGMENTS = 16;
@@ -130,6 +131,51 @@ async function verifyDetachedEd25519(manifestBuffer, signatureText, publicKeyBas
   const publicKey = base64Bytes(publicKeyBase64);
   const key = await crypto.subtle.importKey('raw', publicKey, { name: 'Ed25519' }, false, ['verify']);
   return crypto.subtle.verify({ name: 'Ed25519' }, key, signature, bytes);
+}
+
+async function readBoundedResponse(response, { label, maxBytes, expectedSize = null }) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+    throw new TypeError('Response size limit must be a positive safe integer');
+  }
+  const rawLength = response.headers.get('Content-Length');
+  if (rawLength === null || !/^\d+$/.test(rawLength)) {
+    throw new Error(`${label} response is missing a valid Content-Length`);
+  }
+  const declaredLength = Number(rawLength);
+  if (!Number.isSafeInteger(declaredLength) || declaredLength <= 0 || declaredLength > maxBytes) {
+    throw new Error(`${label} response exceeds its allowed size`);
+  }
+  if (expectedSize !== null && declaredLength !== expectedSize) {
+    throw new Error(`${label} response size differs from its signed manifest`);
+  }
+  if (!response.body || typeof response.body.getReader !== 'function') {
+    throw new Error(`${label} response does not support bounded streaming`);
+  }
+
+  const bytes = new Uint8Array(declaredLength);
+  const reader = response.body.getReader();
+  let offset = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      if (offset + value.byteLength > declaredLength || offset + value.byteLength > maxBytes) {
+        throw new Error(`${label} response exceeded its declared size`);
+      }
+      bytes.set(value, offset);
+      offset += value.byteLength;
+    }
+  } catch (error) {
+    try { await reader.cancel(error); } catch (_) {}
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+  if (offset !== declaredLength) {
+    throw new Error(`${label} response was truncated`);
+  }
+  return bytes;
 }
 
 async function verifySignedManifest(manifestBuffer, signatureText, expectedRelease = '') {
@@ -292,6 +338,9 @@ async function buildFlashPlan(manifest, mode, binaries) {
     if (!buffer) throw new Error(`Missing downloaded firmware image ${image.file}`);
     await validateImageBuffer(buffer, image, manifest);
     plan.push({ data: binaryToBinaryString(buffer), address: image.offset });
+    // esptool-js consumes a binary string. Drop the source ArrayBuffer as soon
+    // as the bounded image has been validated and converted.
+    binaries.delete(image.file);
   }
   for (let index = 1; index < plan.length; index += 1) {
     const previousImage = manifest.modes[mode][index - 1];
@@ -309,6 +358,9 @@ export {
   assertTargetDevice,
   buildFlashPlan,
   confirmFullErase,
+  MAX_MANIFEST_SIZE,
+  MAX_SIGNATURE_SIZE,
+  readBoundedResponse,
   sha256Hex,
   validateImageBuffer,
   validateManifest,

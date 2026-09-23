@@ -6,6 +6,7 @@ import {
   assertTargetDevice,
   buildFlashPlan,
   confirmFullErase,
+  readBoundedResponse,
   sha256Hex,
   validateManifest,
   verifyDetachedEd25519,
@@ -67,6 +68,33 @@ test('Ed25519 verification rejects modified signed manifest bytes', async () => 
   assert.equal(await verifyDetachedEd25519(arrayBuffer(message), signature, rawPublic), false);
 });
 
+test('bounded response reader enforces declared and streamed byte limits', async () => {
+  const accepted = await readBoundedResponse(
+    new Response(new Uint8Array([1, 2, 3, 4]), { headers: { 'Content-Length': '4' } }),
+    { label: 'firmware.bin', maxBytes: 4, expectedSize: 4 },
+  );
+  assert.deepEqual([...accepted], [1, 2, 3, 4]);
+
+  await assert.rejects(
+    readBoundedResponse(new Response('abc'), { label: 'manifest', maxBytes: 64 }),
+    /missing a valid Content-Length/,
+  );
+  await assert.rejects(
+    readBoundedResponse(
+      new Response(new Uint8Array([1, 2, 3, 4, 5]), { headers: { 'Content-Length': '4' } }),
+      { label: 'firmware.bin', maxBytes: 4, expectedSize: 4 },
+    ),
+    /exceeded its declared size/,
+  );
+  await assert.rejects(
+    readBoundedResponse(
+      new Response(new Uint8Array([1, 2, 3]), { headers: { 'Content-Length': '4' } }),
+      { label: 'firmware.bin', maxBytes: 4, expectedSize: 4 },
+    ),
+    /truncated/,
+  );
+});
+
 test('chip identity and destructive confirmation fail closed', () => {
   const manifest = validateManifest(sampleManifest());
   assert.doesNotThrow(() => assertTargetDevice('ESP32-S3', manifest));
@@ -80,11 +108,13 @@ test('flash address and application image come from the validated manifest', asy
   const image = validEsp32S3Image();
   manifest.modes.update[0].size = image.byteLength;
   manifest.modes.update[0].sha256 = await sha256Hex(arrayBuffer(image));
-  const plan = await buildFlashPlan(manifest, 'update', new Map([
+  const binaries = new Map([
     ['firmware.bin', arrayBuffer(image)],
-  ]));
+  ]);
+  const plan = await buildFlashPlan(manifest, 'update', binaries);
   assert.equal(plan.length, 1);
   assert.equal(plan[0].address, 0x10000);
+  assert.equal(binaries.size, 0, 'source ArrayBuffers should be released after conversion');
 });
 
 test('update mode verifies firmware.bin against its own signed digest', async () => {

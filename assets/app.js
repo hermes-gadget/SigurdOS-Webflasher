@@ -8,13 +8,17 @@
 import {
   TARGET_BOARD,
   TARGET_CHIP,
+  MAX_MANIFEST_SIZE,
+  MAX_SIGNATURE_SIZE,
   assertTargetDevice,
   buildFlashPlan,
   confirmFullErase,
+  readBoundedResponse,
   verifySignedManifest,
 } from '/assets/firmware-security.js';
 import { md5Hex } from '/assets/md5.js';
 import { closeSerialPort } from '/assets/serial-cleanup.js';
+import { deriveUiState } from '/assets/ui-state.js';
 
 const API_BASE = '/api';
 const MANIFEST_FILENAME = 'firmware-manifest.json';
@@ -27,6 +31,9 @@ let releaseData = null;       // { stable: {...}, beta: {...} }
 let serialPort = null;
 let esptoolPromise = null;
 let flashing = false;
+let connectionPending = false;
+let connectionOutcome = null;
+let flashOutcome = null;
 let eraseAll = true;
 
 // ── DOM refs ─────────────────────────────
@@ -109,6 +116,30 @@ function setStepStatus(step, status, text) {
 
 function enableBtn(btn, enabled) {
   btn.disabled = !enabled;
+}
+
+function refreshUiState() {
+  const state = deriveUiState({
+    connected: Boolean(serialPort),
+    connectionPending,
+    connectionOutcome,
+    channel: selectedChannel,
+    hasReleaseData: Boolean(releaseData),
+    flashing,
+    flashOutcome,
+    monitoring: captureRunning,
+  });
+
+  connectBtn.textContent = state.connectLabel;
+  enableBtn(connectBtn, state.connectEnabled);
+  flashBtn.textContent = state.flashLabel;
+  enableBtn(flashBtn, state.flashEnabled);
+  stableCard.classList.toggle('channel-card--selected', selectedChannel === 'stable');
+  betaCard.classList.toggle('channel-card--selected', selectedChannel === 'beta');
+  debugCard.classList.toggle('channel-card--selected', selectedChannel === 'debug');
+  setStepStatus(stepConnect, state.connectionStatus.status, state.connectionStatus.text);
+  setStepStatus(stepChannel, state.channelStatus.status, state.channelStatus.text);
+  setStepStatus(stepFlash, state.flashStatus.status, state.flashStatus.text);
 }
 
 // ── Local API ─────────────────────────────
@@ -251,9 +282,16 @@ async function fetchSignedManifest(channel) {
   ]);
   if (!manifestResponse.ok) throw new Error(`Signed manifest download failed: ${manifestResponse.status}`);
   if (!signatureResponse.ok) throw new Error(`Manifest signature download failed: ${signatureResponse.status}`);
-  const manifestBuffer = await manifestResponse.arrayBuffer();
-  const signatureText = await signatureResponse.text();
-  const manifest = await verifySignedManifest(manifestBuffer, signatureText);
+  const manifestBytes = await readBoundedResponse(manifestResponse, {
+    label: MANIFEST_FILENAME,
+    maxBytes: MAX_MANIFEST_SIZE,
+  });
+  const signatureBytes = await readBoundedResponse(signatureResponse, {
+    label: MANIFEST_SIGNATURE_FILENAME,
+    maxBytes: MAX_SIGNATURE_SIZE,
+  });
+  const signatureText = new TextDecoder('utf-8', { fatal: true }).decode(signatureBytes);
+  const manifest = await verifySignedManifest(manifestBytes.buffer, signatureText);
   log(`Verified signed ${manifest.release} manifest for ${manifest.board} / ${manifest.chip}.`, 'green');
   return manifest;
 }
@@ -262,25 +300,30 @@ async function downloadBinary(url, image) {
   log(`Downloading ${image.file}...`);
   const resp = await fetch(url, { cache: 'no-store' });
   if (!resp.ok) throw new Error(`Download failed: ${resp.status}`);
-  const declaredLength = resp.headers.get('Content-Length');
-  if (declaredLength !== null && Number(declaredLength) !== image.size) {
-    throw new Error(`${image.file} response size differs from its signed manifest`);
-  }
-  const buf = await resp.arrayBuffer();
-  if (buf.byteLength !== image.size) throw new Error(`${image.file} size differs from its signed manifest`);
-  log(`Downloaded ${buf.byteLength.toLocaleString()} signed bytes for ${image.file}.`, 'green');
-  return buf;
+  const bytes = await readBoundedResponse(resp, {
+    label: image.file,
+    maxBytes: image.size,
+    expectedSize: image.size,
+  });
+  log(`Downloaded ${bytes.byteLength.toLocaleString()} signed bytes for ${image.file}.`, 'green');
+  return bytes.buffer;
 }
 
 async function prepareFlashPlan(channel, mode) {
   const manifest = await fetchSignedManifest(channel);
   const binaries = new Map();
-  for (const image of manifest.modes[mode]) {
-    const buffer = await downloadBinary(getFirmwareUrl(channel, image.file), image);
-    binaries.set(image.file, buffer);
+  try {
+    for (const image of manifest.modes[mode]) {
+      const buffer = await downloadBinary(getFirmwareUrl(channel, image.file), image);
+      binaries.set(image.file, buffer);
+    }
+    const fileArray = await buildFlashPlan(manifest, mode, binaries);
+    return { manifest, fileArray };
+  } finally {
+    // The vendored esptool-js API needs one binary string per image. Do not
+    // retain its source ArrayBuffer while the much slower flash is underway.
+    binaries.clear();
   }
-  const fileArray = await buildFlashPlan(manifest, mode, binaries);
-  return { manifest, fileArray };
 }
 
 async function withTimeout(promise, ms, msg) {
@@ -291,12 +334,16 @@ async function withTimeout(promise, ms, msg) {
 // ── WebSerial ─────────────────────────────
 async function connectSerial() {
   if (serialPort) {
-    await disconnectSerial();
+    try {
+      await disconnectSerial();
+    } catch (_) {}
     return;
   }
 
-  enableBtn(connectBtn, false);
-  setStepStatus(stepConnect, 'busy', 'Connecting');
+  connectionPending = true;
+  connectionOutcome = null;
+  flashOutcome = null;
+  refreshUiState();
   log('Requesting serial port...');
 
   try {
@@ -306,6 +353,9 @@ async function connectSerial() {
       { usbVendorId: 0x10c4 }, // CP210x
     ];
     serialPort = await navigator.serial.requestPort({ filters });
+    connectionPending = false;
+    connectionOutcome = null;
+    refreshUiState();
 
     const info = serialPort.getInfo || (() => ({}));
     const portInfo = info.call ? info.call(serialPort) : {};
@@ -316,16 +366,13 @@ async function connectSerial() {
       log('Native USB-serial-JTAG detected. Enter download mode before flashing: hold BOOT, tap RESET, release BOOT.', 'orange');
     }
 
-    setStepStatus(stepConnect, 'success', 'Connected');
-    connectBtn.textContent = 'Disconnect';
-    enableBtn(connectBtn, true);
-
     log('Serial port ready for flashing.', 'green');
   } catch (err) {
-    setStepStatus(stepConnect, 'error', 'Failed');
-    enableBtn(connectBtn, true);
-    log(`Connection failed: ${err.message}`, 'red');
     serialPort = null;
+    connectionPending = false;
+    connectionOutcome = 'error';
+    refreshUiState();
+    log(`Connection failed: ${err.message}`, 'red');
   }
 }
 
@@ -341,19 +388,21 @@ async function disconnectSerial() {
     const message = error?.message || String(error);
     log(`Serial disconnect failed: ${message}`, 'red');
     // Keep serialPort set so the caller can retry after the stream unlocks.
+    connectionOutcome = 'error';
+    refreshUiState();
     throw error;
   }
 
   serialPort = null;
-  setStepStatus(stepConnect, 'ready', 'Not connected');
-  connectBtn.textContent = 'Connect T-Deck';
-  enableBtn(connectBtn, true);
+  connectionOutcome = null;
+  flashOutcome = null;
   log('Serial disconnected.', 'dim');
+  refreshUiState();
 }
 
 // ── ESPTool Flash ─────────────────────────
 async function flashFirmware() {
-  if (flashing) return;
+  if (flashing || connectionPending || captureRunning) return;
   if (!serialPort) {
     log('Connect a T-Deck first!', 'red');
     return;
@@ -362,10 +411,14 @@ async function flashFirmware() {
     log('Select a firmware channel first!', 'red');
     return;
   }
+  if (!releaseData) {
+    log('Signed release metadata is unavailable.', 'red');
+    return;
+  }
 
   flashing = true;
-  enableBtn(flashBtn, false);
-  setStepStatus(stepFlash, 'busy', 'Flashing');
+  flashOutcome = null;
+  refreshUiState();
   showProgress(true);
   setProgress(2, 'Loading flasher library');
   consoleEl.classList.add('console--visible');
@@ -465,12 +518,11 @@ async function flashFirmware() {
     } catch (e) {}
 
     setProgress(100, 'Done!');
-    setStepStatus(stepFlash, 'success', 'Flashed!');
+    flashOutcome = 'success';
     log(`✓ ${tagName} flashed successfully!`, 'green');
 
     if (channel === 'debug') {
       log('✓ Debug firmware flashed!', 'green');
-      flashBtn.textContent = 'Flash Complete ✓';
       // Clean up esptool-js transport
       try {
         if (transport) {
@@ -482,15 +534,16 @@ async function flashFirmware() {
         }
       } catch (_) {}
       serialPort = null;
+      refreshUiState();
       startSerialMonitor();
     } else {
       log('Your T-Deck is rebooting. It should boot into SigurdOS momentarily.', 'green');
-      flashBtn.textContent = 'Flash Complete ✓';
       serialPort = null;
+      refreshUiState();
     }
   } catch (err) {
     setProgress(0, 'Error');
-    setStepStatus(stepFlash, 'error', 'Failed');
+    flashOutcome = 'error';
     const errorMessage = err?.message || String(err);
     if (/MD5 of file does not match data in flash/i.test(errorMessage)) {
       log('Flash readback verification failed. The device was not reset; retry in bootloader mode.', 'red');
@@ -498,8 +551,7 @@ async function flashFirmware() {
       log(`Flash error: ${errorMessage}`, 'red');
     }
     log('Try putting the T-Deck into bootloader mode manually: hold BOOT, tap RESET, release BOOT.', 'orange');
-    enableBtn(flashBtn, true);
-    flashBtn.textContent = 'Try Again';
+    refreshUiState();
   } finally {
     // Always release esptool resources so repeated flashes do not leave WebSerial locked.
     try {
@@ -510,6 +562,7 @@ async function flashFirmware() {
     } catch (_) {}
     if (eraseToggle) eraseToggle.disabled = false;
     flashing = false;
+    refreshUiState();
   }
 }
 
@@ -556,8 +609,6 @@ function showCaptureUI(show) {
   if (show) {
     el.style.display = 'block';
     el.scrollIntoView({ behavior: 'smooth' });
-    // Hide flash step status
-    setStepStatus(stepFlash, 'success', 'Flashed!');
   } else {
     el.style.display = 'none';
   }
@@ -605,8 +656,11 @@ function setMonitorButtonState(monitoring) {
 }
 
 async function startMonitorConnect() {
-  if (captureRunning) return;
+  if (captureRunning || connectionPending || flashing) return;
 
+  connectionPending = true;
+  connectionOutcome = null;
+  refreshUiState();
   try {
     logCapture('Requesting serial port... Please select your T-Deck.\n', 'dim');
 
@@ -616,6 +670,7 @@ async function startMonitorConnect() {
       { usbVendorId: 0x10c4 }, // CP210x
     ];
     serialPort = await navigator.serial.requestPort({ filters });
+    refreshUiState();
 
     const info = serialPort.getInfo ? serialPort.getInfo() : {};
     const usbVid = info.usbVendorId?.toString(16) || '?';
@@ -623,6 +678,9 @@ async function startMonitorConnect() {
     logCapture(`Port selected: USB VID=${usbVid} PID=${usbPid}\n`, 'dim');
 
     await serialPort.open({ baudRate: 115200 });
+    connectionPending = false;
+    connectionOutcome = null;
+    refreshUiState();
     logCapture('Port opened at 115200 baud. Listening...\n', 'green');
 
     // Update UI
@@ -639,9 +697,12 @@ async function startMonitorConnect() {
     } catch (cleanupError) {
       logCapture(`[error] Serial cleanup failed: ${cleanupError.message}\n`, 'red');
     }
+    connectionPending = false;
+    connectionOutcome = 'error';
     setMonitorButtonState(false);
     document.getElementById('btn-stop-capture').style.display = 'none';
     setCaptureStatus('Error');
+    refreshUiState();
   }
 }
 
@@ -652,6 +713,7 @@ async function beginCaptureRead() {
   }
 
   captureRunning = true;
+  refreshUiState();
   captureStartTime = Date.now();
 
   // Start timer
@@ -683,6 +745,7 @@ async function beginCaptureRead() {
 
     const stoppedByUser = !captureRunning;
     captureRunning = false;
+    refreshUiState();
     logCapture('\nSerial stream ended.', 'orange');
     if (captureTimerInterval) {
       clearInterval(captureTimerInterval);
@@ -706,6 +769,8 @@ async function beginCaptureRead() {
 
 async function stopCapture() {
   captureRunning = false;
+  connectionPending = true;
+  refreshUiState();
   if (captureTimerInterval) {
     clearInterval(captureTimerInterval);
     captureTimerInterval = null;
@@ -728,10 +793,14 @@ async function stopCapture() {
     setMonitorButtonState(false);
     setCaptureStatus('Stopped');
   } catch (error) {
+    connectionOutcome = 'error';
     setMonitorButtonState(false);
     setCaptureStatus('Disconnect failed');
     document.getElementById('btn-stop-capture').style.display = 'inline-block';
     logCapture(`[error] Serial cleanup failed: ${error?.message || String(error)}\n`, 'red');
+  } finally {
+    connectionPending = false;
+    refreshUiState();
   }
 }
 
@@ -808,15 +877,11 @@ function selectChannel(channel) {
     return;
   }
   selectedChannel = channel;
-  stableCard.classList.toggle('channel-card--selected', channel === 'stable');
-  betaCard.classList.toggle('channel-card--selected', channel === 'beta');
-  debugCard.classList.toggle('channel-card--selected', channel === 'debug');
-  setStepStatus(stepChannel, 'success', 'Selected');
-  enableBtn(flashBtn, !!(serialPort && releaseData));
+  flashOutcome = null;
+  refreshUiState();
   const label = channel === 'stable' ? 'Stable'
               : channel === 'debug' ? 'Debug'
               : 'Beta';
-  flashBtn.textContent = `Flash ${label} Firmware`;
   log(`Selected ${label} channel: ${releaseData?.[channel]?.tag_name || channel}`, 'green');
 }
 
@@ -826,6 +891,7 @@ async function init() {
   if (!('serial' in navigator)) {
     log('Web Serial API not available. Use Chrome/Edge with HTTPS.', 'red');
     document.querySelector('.notice-bar').style.display = 'flex';
+    refreshUiState();
     return;
   }
 
@@ -842,6 +908,7 @@ async function init() {
   if (releaseData) {
     selectChannel(releaseData.stable ? 'stable' : 'beta');
   }
+  refreshUiState();
 }
 
 // ── Event listeners ───────────────────────

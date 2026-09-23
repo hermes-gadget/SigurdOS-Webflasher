@@ -44,3 +44,18 @@ test('stopping the monitor cancels and drains the reader before closing the port
   assert.match(styles, /\.step--active \.step__status/);
   assert.doesNotMatch(styles, /\.step--busy/);
 });
+
+test('flash controls and connection labels are refreshed from current state', () => {
+  assert.match(app, /import \{ deriveUiState \} from '\/assets\/ui-state\.js'/);
+  assert.match(app, /function refreshUiState\(\) \{[\s\S]*deriveUiState\(/);
+  assert.match(app, /serialPort = await navigator\.serial\.requestPort\(\{ filters \}\);\s*connectionPending = false;\s*connectionOutcome = null;\s*refreshUiState\(\)/);
+  assert.match(app, /serialPort = null;\s*refreshUiState\(\)/);
+  assert.match(app, /flashing = false;\s*refreshUiState\(\)/);
+  assert.match(app, /selectedChannel = channel;\s*flashOutcome = null;\s*refreshUiState\(\)/);
+});
+
+test('browser firmware reads require bounded Content-Length and release source buffers', () => {
+  assert.match(app, /readBoundedResponse\(resp, \{[\s\S]*expectedSize: image\.size/);
+  assert.match(app, /binaries\.clear\(\)/);
+  assert.doesNotMatch(app, /resp\.arrayBuffer\(\)/);
+});

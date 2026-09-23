@@ -23,6 +23,7 @@ class StaticServingTests(unittest.TestCase):
             "assets/firmware-security.js": b"safe security",
             "assets/md5.js": b"safe md5",
             "assets/serial-cleanup.js": b"safe cleanup",
+            "assets/ui-state.js": b"safe ui state",
             "assets/styles.css": b"safe css",
             "assets/sigurdos-banner.png": b"safe png",
             "assets/vendor/esptool-js-bundle.js": b"safe vendor",
@@ -64,6 +65,7 @@ class StaticServingTests(unittest.TestCase):
         self.assertEqual((200, b"safe app"), self.status("/assets/app.js"))
         self.assertEqual((200, b"safe md5"), self.status("/assets/md5.js"))
         self.assertEqual((200, b"safe cleanup"), self.status("/assets/serial-cleanup.js"))
+        self.assertEqual((200, b"safe ui state"), self.status("/assets/ui-state.js"))
 
     def test_checkout_secrets_source_and_directories_are_denied(self):
         for path in ("/.env", "/.git/config", "/server.py", "/assets/"):
@@ -80,6 +82,21 @@ class StaticServingTests(unittest.TestCase):
             (200, b"c2lnbmF0dXJl\n"),
             self.status("/api/firmware/dev/firmware-manifest.sig"),
         )
+
+    def test_firmware_response_has_exact_length_and_complete_contents(self):
+        payload = bytes(range(256)) * 1024
+        path = Path(server.VAULT) / "dev" / "streamed.bin"
+        path.write_bytes(payload)
+        with urllib.request.urlopen(self.base_url + "/api/firmware/dev/streamed.bin", timeout=5) as response:
+            self.assertEqual(str(len(payload)), response.headers["Content-Length"])
+            self.assertEqual(payload, response.read())
+
+    def test_firmware_larger_than_flash_size_is_rejected_before_serving(self):
+        path = Path(server.VAULT) / "dev" / "oversized.bin"
+        with path.open("wb") as output:
+            output.truncate(server.MAX_VAULT_FILE_SIZES[".bin"] + 1)
+        status, _ = self.status("/api/firmware/dev/oversized.bin")
+        self.assertEqual(413, status)
 
     def test_server_defaults_to_loopback(self):
         self.assertEqual("127.0.0.1", server.DEFAULT_HOST)
