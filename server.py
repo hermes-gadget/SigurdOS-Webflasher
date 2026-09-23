@@ -33,6 +33,8 @@ import sys
 import time
 import urllib.parse
 
+from firmware_manifest import FLASH_SIZE, MAX_MANIFEST_SIZE, MAX_SIGNATURE_SIZE
+
 # ── config ──────────────────────────────────────────────
 DEFAULT_PORT = 8082
 DEFAULT_HOST = "127.0.0.1"
@@ -52,6 +54,7 @@ STATIC_FILES = {
     "/assets/firmware-security.js": ("assets/firmware-security.js", "application/javascript; charset=utf-8"),
     "/assets/md5.js": ("assets/md5.js", "application/javascript; charset=utf-8"),
     "/assets/serial-cleanup.js": ("assets/serial-cleanup.js", "application/javascript; charset=utf-8"),
+    "/assets/ui-state.js": ("assets/ui-state.js", "application/javascript; charset=utf-8"),
     "/assets/styles.css": ("assets/styles.css", "text/css; charset=utf-8"),
     "/assets/sigurdos-banner.png": ("assets/sigurdos-banner.png", "image/png"),
     "/assets/vendor/esptool-js-bundle.js": (
@@ -59,6 +62,13 @@ STATIC_FILES = {
         "application/javascript; charset=utf-8",
     ),
 }
+
+MAX_VAULT_FILE_SIZES = {
+    ".bin": FLASH_SIZE,
+    ".json": MAX_MANIFEST_SIZE,
+    ".sig": MAX_SIGNATURE_SIZE,
+}
+FILE_STREAM_CHUNK_SIZE = 64 * 1024
 
 # ── path security ───────────────────────────────────────
 SAFE_PATH_RE = re.compile(r"^[a-zA-Z0-9_.\-/]+$")
@@ -213,16 +223,25 @@ class FirmwareHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(404, "Not found")
             return
 
+        source = None
         try:
-            with open(abspath, "rb") as f:
-                data = f.read()
+            source = open(abspath, "rb")
+            size = os.fstat(source.fileno()).st_size
         except OSError:
+            if source is not None:
+                source.close()
             self.send_error(500, "Failed to read file")
             return
 
         # Determine Content-Type
         _, ext = os.path.splitext(abspath)
         ext = ext.lower()
+        maximum_size = MAX_VAULT_FILE_SIZES.get(ext)
+        if maximum_size is None or size <= 0 or size > maximum_size:
+            source.close()
+            self.send_error(413, "Firmware response exceeds the allowed size")
+            return
+
         if ext == ".bin":
             content_type = "application/octet-stream"
         elif ext == ".json":
@@ -247,7 +266,7 @@ class FirmwareHandler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_header("Content-Type", content_type)
 
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Length", str(size))
         # Firmware binaries are immutable — cache aggressively
         if relative_path.startswith("archive/") and ext == ".bin":
             self.send_header("Cache-Control", "public, max-age=86400, immutable")
@@ -255,8 +274,22 @@ class FirmwareHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "public, max-age=3600")
 
         self.end_headers()
-        if not getattr(self, '_is_head', False):
-            self.wfile.write(data)
+        try:
+            if not getattr(self, '_is_head', False):
+                remaining = size
+                while remaining:
+                    chunk = source.read(min(FILE_STREAM_CHUNK_SIZE, remaining))
+                    if not chunk:
+                        # The file changed after its size was checked. End the
+                        # response so the client rejects the truncated body.
+                        self.close_connection = True
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except OSError:
+            self.close_connection = True
+        finally:
+            source.close()
 
     def do_HEAD(self):
         """Route HEAD to do_GET (skip body write via _is_head flag)."""
